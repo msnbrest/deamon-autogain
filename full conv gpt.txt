@@ -1,0 +1,3363 @@
+(réponse courte, résumé ou etape par etape, droit au but)
+j'ai linux (kubuntu) et j'aimerai ajouter un module "mini auto gain" dans la gestion audio (dont les infos seront compilé simplement dans le code, aucune config externe pour ce mini logiciel) car parfois le son est ultra faible donc je dois souvent changer le volume. le but n'est pas de rendre le son beau, mais juste avoir une puissance toujours audible (baisser le volume au moindre peak, remonter doucement pendant 5 secondes) avec un seul multiplicateur qui gere la stereo entre x1 et x40. est-ce possible, et commentaire, en quelques mots, technique, pas besoin de longues phrases.
+
+
+
+Oui, **c’est tout à fait possible**.
+
+### Architecture simple
+
+* Capture audio système → **PipeWire** (idéal sous Kubuntu).
+* Module **Auto Gain** en temps réel.
+* Analyse du niveau RMS/peak.
+* **Peak détecté** → multiplicateur baisse rapidement.
+* **Pas de peak** → multiplicateur remonte progressivement sur **5 s**.
+* Gain unique appliqué aux **2 canaux simultanément** → stéréo conservée.
+* Limiteur : **×1 → ×40**.
+* Pas de config externe : paramètres directement en constantes dans le code.
+
+### Logique
+
+```text
+gain = clamp(gain, 1.0, 40.0)
+
+si peak > seuil:
+    gain *= réduction_rapide
+
+sinon:
+    gain += montée_lente_sur_5s
+```
+
+⚠️ Point important : **×40 peut provoquer du clipping/distorsion**. Pour ton objectif, ajouter un **limiteur/soft-clip très simple en sortie** est fortement recommandé.
+
+Techniquement, je partirais sur **C++ + PipeWire**, avec traitement audio par buffer.
+
+
+
+
+genial,
+si out > seuil alors gain = seuil / out
+le code ou les commandes seront concices avec petit commentaires parfois pour comprendre.
+je pense qu'il faut créer un fichier quelque part, le lier au système, et faire quelques essais.
+
+
+
+Oui. Le plus simple est de faire d’abord un **prototype indépendant**, puis de l’intégrer à PipeWire.
+
+### Étape 1 — créer le dossier
+
+```bash
+mkdir -p ~/mini-autogain
+cd ~/mini-autogain
+```
+
+### Étape 2 — principe du traitement
+
+Ton algorithme peut être exactement :
+
+```cpp
+out = input * gain;
+
+if (out > seuil)
+    gain = seuil / out;       // baisse immédiate
+
+else
+    gain += montée_par_buffer; // remontée sur ~5 s
+
+gain = clamp(gain, 1.0, 40.0);
+```
+
+Pour la stéréo, **le même `gain`** est appliqué à gauche et droite.
+
+### Étape 3 — premier objectif
+
+Je te conseille de faire dans cet ordre :
+
+```text
+1. petit programme C++
+2. entrée audio PipeWire
+3. Auto Gain
+4. sortie PipeWire
+5. tester avec musique/vidéo
+6. ensuite → branchement automatique dans le système
+```
+
+On évite donc de modifier PipeWire directement au début : **prototype → tests → intégration**.
+
+Si tu veux, on peut maintenant faire **l'étape 1 avec le fichier C++ minimal**, commande par commande, très concis.
+
+
+
+
+d'accord, etape 1.
+
+
+
+### Étape 1 — créer le fichier C++
+
+```bash
+mkdir -p ~/mini-autogain
+cd ~/mini-autogain
+nano autogain.cpp
+```
+
+Colle ceci :
+
+```cpp
+#include <iostream>
+
+int main()
+{
+    std::cout << "Mini Auto Gain OK\n";
+    return 0;
+}
+```
+
+Sauvegarde `Ctrl+O`, Entrée, puis `Ctrl+X`.
+
+### Compiler
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain
+```
+
+### Tester
+
+```bash
+./autogain
+```
+
+Tu dois obtenir :
+
+```text
+Mini Auto Gain OK
+```
+
+**Étape 1 terminée.** Ensuite on attaque **PipeWire + entrée/sortie audio**.
+
+
+
+
+etape validé, etape 2.
+
+
+
+## Étape 2 — connecter le programme à PipeWire
+
+On va d'abord vérifier que les outils PipeWire sont présents.
+
+```bash
+which pw-cat
+which pw-cli
+```
+
+Puis :
+
+```bash
+pw-cli info 0 | head
+```
+
+Si ça répond correctement, installe les headers nécessaires au développement :
+
+```bash
+sudo apt install libpipewire-0.3-dev
+```
+
+Ensuite vérifie :
+
+```bash
+pkg-config --cflags --libs libpipewire-0.3
+```
+
+Tu devrais obtenir quelque chose ressemblant à :
+
+```text
+-I/usr/include/pipewire-0.3 ... -lpipewire-0.3
+```
+
+### Test audio avant de coder
+
+Liste les périphériques :
+
+```bash
+pw-cli ls Node | grep -E 'node.name|media.class'
+```
+
+👉 **Ne modifie rien dans le système pour l'instant.**
+
+Envoie-moi simplement la sortie de :
+
+```bash
+pw-cli ls Node | grep -E 'node.name|media.class'
+```
+
+et on fait **l'étape 3 : créer le vrai flux audio PipeWire**.
+
+
+
+
+voici le résultat, peux tu préciser ce qui est utile pour la suite dans ce résultat, puis passer à l'étape 3.
+node.name="Dummy-Driver"
+node.name="Freewheel-Driver"
+node.name="Midi-Bridge"
+media.class="Midi/Bridge"
+node.name="bluez_midi.server"
+media.class="Midi/Bridge"
+node.name="alsa_output.pci-0000_00_1f.3.analog-stereo"
+media.class="Audio/Sink"
+node.name="alsa_input.pci-0000_00_1f.3.analog-stereo"
+media.class="Audio/Source"
+node.name="v4l2_input.pci-0000_00_14.0-usb-0_6_1.0"
+media.class="Video/Source"
+node.name="Firefox"
+media.class="Stream/Output/Audio"
+
+
+
+Oui. Pour la suite, **les 3 lignes importantes sont** :
+
+```text
+alsa_output.pci-0000_00_1f.3.analog-stereo   → sortie audio physique
+alsa_input.pci-0000_00_1f.3.analog-stereo    → entrée micro
+Firefox                                       → flux audio actuel
+```
+
+Pour notre Auto Gain, on s'intéresse surtout à la **sortie** :
+
+```text
+alsa_output.pci-0000_00_1f.3.analog-stereo
+```
+
+## Étape 3 — premier flux PipeWire
+
+On va d'abord faire un test **sans encore intégrer l'Auto Gain**.
+
+Installe les outils de développement :
+
+```bash
+sudo apt install libpipewire-0.3-dev
+```
+
+Puis remplace le contenu de `autogain.cpp` :
+
+```cpp
+#include <pipewire/pipewire.h>
+#include <iostream>
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    std::cout << "PipeWire OK\n";
+
+    pw_deinit();
+    return 0;
+}
+```
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Teste :
+
+```bash
+./autogain
+```
+
+Résultat attendu :
+
+```text
+PipeWire OK
+```
+
+### Ensuite
+
+Si c'est validé, **étape 4 = créer réellement un nœud audio PipeWire** :
+
+```text
+Firefox
+   ↓
+[ Mini Auto Gain ]
+   ↓
+alsa_output...
+```
+
+Et là on pourra enfin recevoir les samples, calculer `out`, puis appliquer ton `gain ×1 → ×40`.
+
+
+
+
+validé, aucun soucis pour l'instant. etape 4 !
+
+
+
+Parfait. **Étape 4 : créer un nœud audio PipeWire**. On va seulement vérifier que notre programme peut se connecter au graphe audio, sans encore modifier le son.
+
+Remplace `autogain.cpp` par :
+
+```cpp id="k8x2pz"
+#include <pipewire/pipewire.h>
+#include <iostream>
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    pw_main_loop* loop = pw_main_loop_new(nullptr);
+    pw_context* context = pw_context_new(
+        pw_main_loop_get_loop(loop), nullptr, 0);
+
+    pw_core* core = pw_context_connect(context, nullptr, 0);
+
+    if (!core) {
+        std::cerr << "Connexion PipeWire impossible\n";
+        return 1;
+    }
+
+    std::cout << "Connecté à PipeWire\n";
+
+    pw_core_disconnect(core);
+    pw_context_destroy(context);
+    pw_main_loop_destroy(loop);
+    pw_deinit();
+
+    return 0;
+}
+```
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Teste :
+
+```bash
+./autogain
+```
+
+Résultat attendu :
+
+```text
+Connecté à PipeWire
+```
+
+### Pourquoi cette étape ?
+
+On a maintenant :
+
+```text
+C++
+ ↓
+PipeWire
+```
+
+À l'étape suivante, on crée le vrai **audio stream** :
+
+```text
+Firefox → AutoGain → sortie ALSA
+             ↑
+        traitement samples
+```
+
+**Ne touche encore à aucun réglage système.**
+
+
+
+
+parfait, genial
+
+
+
+Parfait 👍
+
+On a donc validé :
+
+```text
+C++ → PipeWire
+```
+
+La prochaine étape est la plus intéressante : **recevoir les samples audio et les renvoyer**, sans Auto Gain dans un premier temps.
+
+Puis on ajoutera simplement :
+
+```text
+peak → gain = seuil / out
+pas de peak → remontée sur 5 s
+gain ∈ [1, 40]
+```
+
+On avance proprement, étape par étape.
+
+
+
+
+ok, etape suivante
+
+
+
+
+## Étape 5 — créer le flux audio stéréo
+
+On va maintenant créer un **flux PipeWire virtuel** en `float32 / stéréo`, avec callback audio. Pour l'instant, il ne fait qu'afficher que des buffers arrivent.
+
+Remplace `autogain.cpp` par :
+
+```cpp id="q7m3kx"
+#include <pipewire/pipewire.h>
+#include <pipewire/stream.h>
+#include <spa/param/audio/format-utils.h>
+
+#include <iostream>
+
+static void on_process(void *data)
+{
+    pw_stream *stream = static_cast<pw_stream *>(data);
+
+    pw_buffer *b = pw_stream_dequeue_buffer(stream);
+    if (!b)
+        return;
+
+    std::cout << "Buffer audio reçu\n";
+
+    pw_stream_queue_buffer(stream, b);
+}
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    pw_main_loop *loop = pw_main_loop_new(nullptr);
+    pw_context *context =
+        pw_context_new(pw_main_loop_get_loop(loop), nullptr, 0);
+
+    pw_core *core = pw_context_connect(context, nullptr, 0);
+
+    if (!core) {
+        std::cerr << "Connexion PipeWire impossible\n";
+        return 1;
+    }
+
+    pw_stream_events events{};
+    events.version = PW_VERSION_STREAM_EVENTS;
+    events.process = on_process;
+
+    pw_stream *stream = pw_stream_new_simple(
+        pw_main_loop_get_loop(loop),
+        "Mini Auto Gain",
+        nullptr,
+        &events,
+        nullptr
+    );
+
+    spa_audio_info_raw audio{};
+    audio.format = SPA_AUDIO_FORMAT_F32;
+    audio.rate   = 48000;
+    audio.channels = 2;
+    audio.position[0] = SPA_AUDIO_CHANNEL_FL;
+    audio.position[1] = SPA_AUDIO_CHANNEL_FR;
+
+    auto params = spa_format_audio_raw_build(
+        SPA_PARAM_EnumFormat,
+        &audio
+    );
+
+    pw_stream_connect(
+        stream,
+        PW_DIRECTION_OUTPUT,
+        PW_ID_ANY,
+        static_cast<pw_stream_flags>(
+            PW_STREAM_FLAG_AUTOCONNECT |
+            PW_STREAM_FLAG_MAP_BUFFERS |
+            PW_STREAM_FLAG_RT_PROCESS
+        ),
+        &params,
+        1
+    );
+
+    std::cout << "Mini Auto Gain démarré\n";
+
+    pw_main_loop_run(loop);
+
+    pw_stream_destroy(stream);
+    pw_core_disconnect(core);
+    pw_context_destroy(context);
+    pw_main_loop_destroy(loop);
+    pw_deinit();
+
+    return 0;
+}
+```
+
+### Compiler
+
+```bash id="2j3v5k"
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+### Lancer
+
+```bash id="q8k4sp"
+./autogain
+```
+
+Tu devrais voir :
+
+```text
+Mini Auto Gain démarré
+Buffer audio reçu
+Buffer audio reçu
+Buffer audio reçu
+...
+```
+
+`Ctrl+C` pour arrêter.
+
+⚠️ **À cette étape, aucun son ne doit encore être modifié.** On vérifie simplement que le callback reçoit bien des buffers.
+
+Si tu obtiens une erreur de compilation, **envoie-moi l'erreur exacte** plutôt que de modifier le code : on l'adaptera à ta version de PipeWire.
+
+
+
+
+error: cannot convert ‘spa_param_type’ to ‘spa_pod_builder*’
+
+
+
+Oui, petite erreur de ma part : `spa_format_audio_raw_build()` nécessite un **builder SPA** en premier argument.
+
+### Correction
+
+Ajoute :
+
+```cpp
+#include <spa/pod/builder.h>
+```
+
+Puis remplace :
+
+```cpp
+auto params = spa_format_audio_raw_build(
+    SPA_PARAM_EnumFormat,
+    &audio
+);
+```
+
+par :
+
+```cpp
+uint8_t buffer[1024];
+spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+
+const spa_pod *params =
+    spa_format_audio_raw_build(
+        &builder,
+        SPA_PARAM_EnumFormat,
+        &audio
+    );
+```
+
+Et remplace dans `pw_stream_connect()` :
+
+```cpp
+&params,
+```
+
+par :
+
+```cpp
+&params,
+```
+
+**Donc cette partie reste identique** : `params` est maintenant un pointeur.
+
+Compile à nouveau :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Puis :
+
+```bash
+./autogain
+```
+
+Si ça compile, on continue avec le **vrai passage des samples gauche/droite**.
+
+
+
+
+probleme, voici la sortie de console :
+[resultat]
+./autogain
+Mini Auto Gain démarré
+Erreur de segmentation     (core dumped) ./autogain
+
+
+
+Oui. **C'est notre code qui est en cause**, pas ton installation.
+
+Le problème vient très probablement de la gestion du `pw_stream`/callback. On va repartir sur une version minimale et plus sûre.
+
+### Étape 5 — correction
+
+Remplace entièrement `autogain.cpp` par :
+
+```cpp id="r4k8mz"
+#include <pipewire/pipewire.h>
+#include <pipewire/stream.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/pod/builder.h>
+
+#include <iostream>
+
+static void on_process(void *data)
+{
+    pw_stream *stream = static_cast<pw_stream *>(data);
+
+    pw_buffer *buffer = pw_stream_dequeue_buffer(stream);
+
+    if (!buffer)
+        return;
+
+    // Pour l'instant : on reçoit et renvoie le buffer sans le modifier.
+    pw_stream_queue_buffer(stream, buffer);
+}
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    pw_main_loop *loop = pw_main_loop_new(nullptr);
+    if (!loop)
+        return 1;
+
+    pw_context *context =
+        pw_context_new(pw_main_loop_get_loop(loop), nullptr, 0);
+
+    if (!context)
+        return 1;
+
+    pw_core *core =
+        pw_context_connect(context, nullptr, 0);
+
+    if (!core) {
+        std::cerr << "Connexion PipeWire impossible\n";
+        return 1;
+    }
+
+    pw_stream_events events{};
+    events.version = PW_VERSION_STREAM_EVENTS;
+    events.process = on_process;
+
+    pw_stream *stream = pw_stream_new_simple(
+        pw_main_loop_get_loop(loop),
+        "Mini Auto Gain",
+        nullptr,
+        &events,
+        nullptr
+    );
+
+    if (!stream) {
+        std::cerr << "Création du stream impossible\n";
+        return 1;
+    }
+
+    uint8_t pod_buffer[1024];
+
+    spa_pod_builder builder =
+        SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
+
+    spa_audio_info_raw audio{};
+    audio.format = SPA_AUDIO_FORMAT_F32;
+    audio.rate = 48000;
+    audio.channels = 2;
+
+    audio.position[0] = SPA_AUDIO_CHANNEL_FL;
+    audio.position[1] = SPA_AUDIO_CHANNEL_FR;
+
+    const spa_pod *params =
+        spa_format_audio_raw_build(
+            &builder,
+            SPA_PARAM_EnumFormat,
+            &audio
+        );
+
+    int result = pw_stream_connect(
+        stream,
+        PW_DIRECTION_OUTPUT,
+        PW_ID_ANY,
+        static_cast<pw_stream_flags>(
+            PW_STREAM_FLAG_AUTOCONNECT |
+            PW_STREAM_FLAG_MAP_BUFFERS |
+            PW_STREAM_FLAG_RT_PROCESS
+        ),
+        &params,
+        1
+    );
+
+    if (result < 0) {
+        std::cerr << "Erreur pw_stream_connect: "
+                  << result << "\n";
+        return 1;
+    }
+
+    std::cout << "Mini Auto Gain démarré\n";
+
+    pw_main_loop_run(loop);
+
+    pw_stream_destroy(stream);
+    pw_core_disconnect(core);
+    pw_context_destroy(context);
+    pw_main_loop_destroy(loop);
+    pw_deinit();
+
+    return 0;
+}
+```
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Puis :
+
+```bash
+./autogain
+```
+
+### Important
+
+Cette fois, **ne t'attends pas forcément à voir `Buffer audio reçu`** : on ne l'affiche plus.
+
+Le programme doit simplement rester lancé :
+
+```text
+Mini Auto Gain démarré
+```
+
+et **ne pas faire de segmentation fault**.
+
+Si c'est stable, prochaine étape : **récupérer réellement `buffer->buffer->datas[0].data` et lire les samples `L/R`**.
+
+
+
+
+mince, meme probleme, donc plantage logiciel (Message: Process 51084 (autogain) of user 1000 dumped core.)
+[resultat]
+./autogain
+Mini Auto Gain démarré
+Erreur de segmentation     (core dumped) ./autogain
+
+
+
+Oui — j'ai identifié le bug. **C'est bien notre code.**
+
+Le callback reçoit `nullptr` parce qu'on avait fait :
+
+```cpp
+pw_stream_new_simple(..., &events, nullptr);
+```
+
+Puis le callback traitait ce `nullptr` comme un `pw_stream*` → **segmentation fault**.
+
+### Correction simple
+
+Utilisons un pointeur global pour ce prototype.
+
+Remplace :
+
+```cpp
+static void on_process(void *data)
+{
+    pw_stream *stream = static_cast<pw_stream *>(data);
+```
+
+par :
+
+```cpp
+static pw_stream *stream_global = nullptr;
+
+static void on_process(void *data)
+{
+    pw_stream *stream = stream_global;
+```
+
+Et juste après la création du stream :
+
+```cpp
+pw_stream *stream = pw_stream_new_simple(
+    pw_main_loop_get_loop(loop),
+    "Mini Auto Gain",
+    nullptr,
+    &events,
+    nullptr
+);
+
+if (!stream) {
+    std::cerr << "Création du stream impossible\n";
+    return 1;
+}
+
+stream_global = stream;
+```
+
+Le reste ne change pas.
+
+### Recompile
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Puis :
+
+```bash
+./autogain
+```
+
+Cette fois, il ne devrait plus planter.
+
+**Ensuite seulement**, on récupère les samples `float` gauche/droite.
+
+
+
+
+ça reste connecté, genial !
+
+
+
+Parfait 👍
+
+On a maintenant :
+
+```text
+C++ → PipeWire → stream actif
+```
+
+### Étape 6
+
+On va faire **le vrai passage audio** :
+
+```text
+entrée audio
+   ↓
+samples L/R
+   ↓
+Auto Gain
+   ↓
+sortie audio
+```
+
+Et pour commencer, **gain fixe = ×1**, donc aucun changement sonore.
+On vérifiera ensuite que les samples circulent correctement avant d'activer le ×1 → ×40.
+
+C'est la bonne étape avant d'implémenter l'algorithme.
+
+
+
+
+d'accord
+
+
+
+Parfait. Petite correction importante : **pour traiter un flux existant, `pw_filter` est plus adapté que `pw_stream`**. PipeWire le prévoit précisément pour les filtres DSP. ([PipeWire][1])
+
+## Étape 6 — vrai filtre stéréo, gain ×1
+
+On crée **2 canaux indépendants dans le code**, mais le gain sera ensuite commun aux deux.
+
+Remplace entièrement `autogain.cpp` :
+
+```cpp
+#include <pipewire/pipewire.h>
+#include <pipewire/filter.h>
+
+#include <spa/param/audio/format-utils.h>
+
+#include <cstring>
+#include <iostream>
+
+struct Data {
+    pw_main_loop *loop;
+    pw_filter *filter;
+
+    void *in_l;
+    void *out_l;
+
+    void *in_r;
+    void *out_r;
+};
+
+static void on_process(void *userdata, spa_io_position *position)
+{
+    Data *d = static_cast<Data *>(userdata);
+
+    uint32_t n = position->clock.duration;
+
+    float *in_l  = static_cast<float *>(
+        pw_filter_get_dsp_buffer(d->in_l, n));
+
+    float *out_l = static_cast<float *>(
+        pw_filter_get_dsp_buffer(d->out_l, n));
+
+    float *in_r  = static_cast<float *>(
+        pw_filter_get_dsp_buffer(d->in_r, n));
+
+    float *out_r = static_cast<float *>(
+        pw_filter_get_dsp_buffer(d->out_r, n));
+
+    if (!in_l || !out_l || !in_r || !out_r)
+        return;
+
+    // Pour l'instant : gain ×1
+    std::memcpy(out_l, in_l, n * sizeof(float));
+    std::memcpy(out_r, in_r, n * sizeof(float));
+}
+
+static const pw_filter_events events = {
+    PW_VERSION_FILTER_EVENTS,
+    .process = on_process
+};
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    Data d{};
+
+    d.loop = pw_main_loop_new(nullptr);
+
+    d.filter = pw_filter_new_simple(
+        pw_main_loop_get_loop(d.loop),
+        "Mini Auto Gain",
+        pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Filter",
+            PW_KEY_MEDIA_ROLE, "DSP",
+            nullptr),
+        &events,
+        &d
+    );
+
+    d.in_l = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_INPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "input_FL",
+            nullptr),
+        nullptr, 0);
+
+    d.out_l = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_OUTPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "output_FL",
+            nullptr),
+        nullptr, 0);
+
+    d.in_r = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_INPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "input_FR",
+            nullptr),
+        nullptr, 0);
+
+    d.out_r = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_OUTPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "output_FR",
+            nullptr),
+        nullptr, 0);
+
+    if (pw_filter_connect(
+            d.filter,
+            PW_FILTER_FLAG_RT_PROCESS,
+            nullptr, 0) < 0) {
+
+        std::cerr << "Erreur connexion filtre\n";
+        return 1;
+    }
+
+    std::cout << "Mini Auto Gain actif\n";
+
+    pw_main_loop_run(d.loop);
+
+    pw_filter_destroy(d.filter);
+    pw_main_loop_destroy(d.loop);
+    pw_deinit();
+}
+```
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Lance :
+
+```bash
+./autogain
+```
+
+### Vérifier les ports
+
+Dans **un deuxième terminal** :
+
+```bash
+pw-link -o | grep -E "Firefox|Mini"
+```
+
+puis :
+
+```bash
+pw-link -i | grep -E "Firefox|Mini|alsa_output"
+```
+
+On veut obtenir quelque chose du genre :
+
+```text
+Firefox:output_FL
+Firefox:output_FR
+
+Mini Auto Gain:input_FL
+Mini Auto Gain:input_FR
+Mini Auto Gain:output_FL
+Mini Auto Gain:output_FR
+
+alsa_output...:playback_FL
+alsa_output...:playback_FR
+```
+
+**Ne fais pas encore les `pw-link` manuellement.** Envoie-moi simplement ces deux sorties.
+
+Ensuite on fera les 4 connexions, puis on vérifiera réellement que **Firefox → AutoGain → haut-parleurs** fonctionne.
+
+[1]: https://docs.pipewire.org/page_tutorial7.html?utm_source=chatgpt.com "PipeWire: Tutorial - Part 7: Creating an Audio DSP Filter"
+
+
+
+
+oui, ce sont les mêmes noms
+
+
+
+Parfait. 👍
+
+### Étape 7 — connecter le filtre
+
+Avec `./autogain` lancé, regarde d'abord les liens actuels :
+
+```bash
+pw-link -l
+```
+
+Puis **ne connecte rien pour l'instant**.
+
+Il nous faut simplement connaître les noms exacts des ports du filtre :
+
+```bash
+pw-link -o | grep "Mini Auto Gain"
+pw-link -i | grep "Mini Auto Gain"
+```
+
+Tu devrais avoir environ :
+
+```text
+Mini Auto Gain:output_FL
+Mini Auto Gain:output_FR
+Mini Auto Gain:input_FL
+Mini Auto Gain:input_FR
+```
+
+Envoie-moi cette sortie exacte. Ensuite je te donne **les 4 commandes `pw-link`**, sans toucher au reste du système.
+
+
+
+
+dans pw-link liste, il y a par exemple :
+Firefox\:output\_FL
+  |-> alsa\_output.pci-0000\_00\_1f.3.analog-stereo\:playback\_FL
+
+les noms exacte sont :
+**Mini Auto Gain**:output\_FL
+**Mini Auto Gain**:output\_FR
+**Mini Auto Gain**:input\_FL
+**Mini Auto Gain**:input\_FR
+
+
+
+Parfait. On va faire le chaînage :
+
+```text
+Firefox → Mini Auto Gain → ALSA
+```
+
+### 1. Déconnecter Firefox directement des haut-parleurs
+
+```bash
+pw-link -d \
+"Firefox:output_FL" \
+"alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FL"
+
+pw-link -d \
+"Firefox:output_FR" \
+"alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FR"
+```
+
+### 2. Connecter Firefox → Auto Gain
+
+```bash
+pw-link \
+"Firefox:output_FL" \
+"Mini Auto Gain:input_FL"
+
+pw-link \
+"Firefox:output_FR" \
+"Mini Auto Gain:input_FR"
+```
+
+### 3. Connecter Auto Gain → haut-parleurs
+
+```bash
+pw-link \
+"Mini Auto Gain:output_FL" \
+"alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FL"
+
+pw-link \
+"Mini Auto Gain:output_FR" \
+"alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FR"
+```
+
+### 4. Vérifier
+
+```bash
+pw-link -l
+```
+
+Tu dois avoir :
+
+```text
+Firefox:output_FL
+    → Mini Auto Gain:input_FL
+Mini Auto Gain:output_FL
+    → alsa_output...:playback_FL
+
+Firefox:output_FR
+    → Mini Auto Gain:input_FR
+Mini Auto Gain:output_FR
+    → alsa_output...:playback_FR
+```
+
+🎯 **À ce stade, le son doit être identique**, car notre filtre fait encore `gain = 1`.
+
+Si le son passe correctement, prochaine étape : **calculer le peak + `gain = seuil / out`**, puis la remontée progressive sur 5 secondes.
+
+
+
+
+le son est similaire, mais je vois qu'après un play pause, il y a un changement dans la liste, firefox va directement vers alsa.
+
+
+
+Oui, c'est normal avec PipeWire : **Firefox recrée son flux après Play/Pause**, et les connexions manuelles peuvent disparaître.
+
+Mais surtout : **ne continuons pas avec `pw-link` manuel**. Pour notre mini logiciel, il faut que le filtre soit **automatiquement inséré dans le graphe**.
+
+### Étape suivante : auto-connexion
+
+On va modifier le programme pour que :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓
+sortie système
+```
+
+reste valable même si Firefox recrée son flux.
+
+Et ensuite on pourra lancer simplement :
+
+```bash
+./autogain
+```
+
+sans refaire les `pw-link`.
+
+**Ne change rien pour l'instant.** Le comportement que tu observes confirme justement qu'il faut passer à cette méthode.
+
+
+
+
+d'accord
+
+
+
+### Étape 8 — auto-connexion
+
+On va d'abord utiliser la méthode PipeWire prévue pour ça : **`pw_filter` + propriétés de ciblage**, plutôt que des `pw-link` temporaires.
+
+Mais avant de modifier le code, vérifions un détail utile :
+
+```bash
+pw-cli info "Mini Auto Gain" | grep -E "node.name|media.class|media.role"
+```
+
+Puis :
+
+```bash
+pw-cli ls Node | grep -A5 -B2 "Mini Auto Gain"
+```
+
+Envoie-moi le résultat.
+
+👉 Ça permettra de voir **comment PipeWire identifie exactement notre filtre**, et je te donnerai ensuite le petit changement précis pour l'auto-routage.
+
+
+
+
+resultat info :
+\*               **media.role** = "DSP"
+\*               **node.name** = "Mini Auto Gain"
+
+resultat node :
+               object.serial = "184"
+                client.id = "82"
+                node.name = "**Mini Auto Gain**"
+                media.type = "Audio"
+                media.category = "Filter"
+                media.role = "DSP"
+
+
+
+Oui, ces informations sont bonnes. Mais elles montrent aussi que **`media.role=DSP` ne suffit pas pour l'auto-routage**.
+
+PipeWire fournit `node.autoconnect` pour demander l'auto-connexion. ([PipeWire Documentation][1])
+
+### Étape 8 — petit changement
+
+Dans `pw_filter_new_simple()`, remplace les propriétés par :
+
+```cpp
+pw_properties_new(
+    PW_KEY_MEDIA_TYPE, "Audio",
+    PW_KEY_MEDIA_CATEGORY, "Filter",
+    PW_KEY_MEDIA_ROLE, "DSP",
+    PW_KEY_NODE_AUTOCONNECT, "true",
+    nullptr)
+```
+
+Donc simplement ajouter :
+
+```cpp
+PW_KEY_NODE_AUTOCONNECT, "true",
+```
+
+Puis compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Lance :
+
+```bash
+./autogain
+```
+
+Ensuite lance/re-lance une vidéo Firefox et vérifie :
+
+```bash
+pw-link -l
+```
+
+### Objectif
+
+On veut que PipeWire puisse reconnecter automatiquement le filtre au graphe, plutôt que dépendre des `pw-link` manuels. `pw_filter` est justement conçu pour traiter des flux audio existants. ([PipeWire Documentation][2])
+
+Si Firefox continue à contourner le filtre après Play/Pause, **on passera à une règle WirePlumber ciblée** : ce sera la solution robuste.
+
+[1]: https://docs.pipewire.org/group__pw__keys.html?utm_source=chatgpt.com "PipeWire: Key Names"
+[2]: https://docs.pipewire.org/page_tutorial7.html?utm_source=chatgpt.com "PipeWire: Tutorial - Part 7: Creating an Audio DSP Filter"
+
+
+
+
+liste vide, puis play pause, la liste contient firefox vers alsa.
+
+
+
+Oui. Ça confirme que **`node.autoconnect=true` ne suffit pas** : PipeWire reconnecte Firefox directement à ALSA.
+
+On va arrêter les `pw-link` manuels et utiliser **WirePlumber**, qui gère précisément ces connexions dynamiques.
+
+### Étape 9 — vérifier WirePlumber
+
+```bash
+systemctl --user status wireplumber --no-pager
+```
+
+Puis :
+
+```bash
+wireplumber --version
+```
+
+Et :
+
+```bash
+ls ~/.config/wireplumber
+```
+
+Envoie-moi les **3 sorties**.
+
+👉 Ensuite je te donne une petite règle WirePlumber qui fera :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓
+ALSA
+```
+
+automatiquement à chaque nouveau flux Firefox, y compris après **Play/Pause**.
+
+
+
+
+voici les résultats :
+$ systemctl --user status wireplumber --no-pager
+**●** wireplumber.service - Multimedia Service Session Manager
+     Loaded: loaded (/usr/lib/systemd/user/wireplumber.service; **enabled**; preset: **enabled**)
+     Active: **active (running)** since Mon 2026-09-14 02:32:24 CEST; 7h ago
+ Invocation: 8ad455a839174c819a94b461d7d91934
+   Main PID: 47426 (wireplumber)
+      Tasks: 6 (limit: 34600)
+     Memory: 6.9M (peak: 8.9M)
+        CPU: 2.019s
+     CGroup: /user.slice/user-1000.slice/user\@1000.service/session.slice/wireplumber.service
+             └─47426 /usr/bin/wireplumber
+
+sept. 14 02:32:24 session1-82rf systemd[2030]: Started wireplumber.service - Multimedia Service Session Manager.
+sept. 14 02:32:26 session1-82rf wireplumber[47426]: **wp-device: SPA handle 'api.libcamera.enum.manager' could not be loaded; is it installed?**
+sept. 14 02:32:26 session1-82rf wireplumber[47426]: **s-monitors-libcamera: PipeWire's libcamera SPA plugin is missing or broken. Some camera types may not be supported.**
+$ wireplumber --version
+wireplumber
+Compiled with libwireplumber 0.5.13
+Linked with libwireplumber 0.5.13
+$ ls \~/.config/wireplumber
+ls: impossible d'accéder à '/home/session1/.config/wireplumber' : Aucun fichier ou répertoire de ce type
+
+
+
+Parfait. **WirePlumber 0.5.13**, donc on utilise la configuration moderne `.conf`, pas les anciens scripts Lua.
+
+Le warning `libcamera` est **sans rapport avec l'audio**.
+
+### Étape 9 — préparer WirePlumber
+
+Crée le dossier :
+
+```bash id="c6h4bx"
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d
+```
+
+Puis crée :
+
+```bash id="m6z1sa"
+nano ~/.config/wireplumber/wireplumber.conf.d/90-mini-autogain.conf
+```
+
+Pour l'instant, **ne mets rien dedans**.
+
+Sauvegarde `Ctrl+O`, Entrée, `Ctrl+X`.
+
+Puis vérifie que WirePlumber accepte bien la configuration :
+
+```bash id="qv4z6f"
+systemctl --user restart wireplumber
+```
+
+Et :
+
+```bash id="t7g0pd"
+systemctl --user status wireplumber --no-pager
+```
+
+Il doit rester :
+
+```text
+Active: active (running)
+```
+
+### Pourquoi ?
+
+On va ensuite mettre **une règle ciblée** qui reconnaît :
+
+```text
+node.name = "Mini Auto Gain"
+```
+
+et les flux audio de Firefox, sans perturber les autres applications.
+
+**Ne mets encore aucune règle** : cette étape vérifie simplement que notre emplacement de configuration fonctionne avec WirePlumber 0.5.13.
+
+
+
+
+resultat
+    Active: **active (running) 3s ago**
+
+
+
+
+Parfait. ✅
+
+### Étape 10 — règle WirePlumber
+
+On va maintenant ajouter une règle qui **cible uniquement Firefox**.
+
+Ouvre :
+
+```bash id="l2p8cz"
+nano ~/.config/wireplumber/wireplumber.conf.d/90-mini-autogain.conf
+```
+
+Colle :
+
+```ini id="r0m7kq"
+monitor.alsa.rules = [
+  {
+    matches = [
+      {
+        node.name = "Firefox"
+      }
+    ]
+    actions = {
+      update-props = {
+        target.object = "Mini Auto Gain"
+      }
+    }
+  }
+]
+```
+
+Sauvegarde puis :
+
+```bash id="8d5g2m"
+systemctl --user restart wireplumber
+```
+
+### Test
+
+Lance `./autogain`, puis une vidéo Firefox.
+
+Ensuite :
+
+```bash id="z2r4vb"
+pw-link -l
+```
+
+⚠️ **Si Firefox reste directement connecté à ALSA**, ne change rien et donne-moi simplement la sortie de `pw-link -l`.
+
+Cette règle est un **premier test** : selon la version WirePlumber, `target.object` peut ne pas être la bonne propriété pour imposer une connexion. Dans ce cas, on passera à la méthode WirePlumber `linking` correcte.
+
+
+
+
+
+resultat
+$ pw-link -l
+alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FL
+  |<- Firefox:output_FL
+alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FR
+  |<- Firefox:output_FR
+Firefox:output_FL
+  |-> alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FL
+Firefox:output_FR
+  |-> alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FR
+
+
+
+
+Exact : la règle précédente **n'a pas créé de lien**. On la retire pour éviter une fausse piste.
+
+```bash id="f2z8x1"
+rm ~/.config/wireplumber/wireplumber.conf.d/90-mini-autogain.conf
+systemctl --user restart wireplumber
+```
+
+### Point important
+
+Pour que ça fonctionne automatiquement, il faut que notre programme soit vu comme **un filtre de session avec ports compatibles**, puis utiliser le mécanisme de linking de WirePlumber.
+
+Mais avant de toucher encore à WirePlumber, faisons une chose propre : **vérifier que notre filtre possède réellement les ports et qu'ils sont visibles comme ports PipeWire**.
+
+Lance `./autogain`, puis :
+
+```bash id="3w0j7f"
+pw-link -o | grep "Mini Auto Gain"
+```
+
+et :
+
+```bash id="q9r4sm"
+pw-link -i | grep "Mini Auto Gain"
+```
+
+Puis :
+
+```bash id="v4p6ky"
+pw-cli info "Mini Auto Gain"
+```
+
+👉 Envoie-moi ces trois sorties.
+
+**On ne modifie plus la configuration WirePlumber avant ça.** On va d'abord rendre le filtre correctement identifiable, puis automatiser le routage.
+
+
+
+
+les noms sont pareil qu'avant, voici cli info :
+        id: 83
+        permissions: rwxm-
+        type: PipeWire:Interface:Node/3
+*       input ports: 2/4294967295
+*       output ports: 2/4294967295
+*       state: "suspended"
+*       properties:
+*               media.type = "Audio"
+*               media.category = "Filter"
+*               media.role = "DSP"
+*               node.autoconnect = "true"
+*               media.name = "Mini Auto Gain"
+*               node.name = "Mini Auto Gain"
+*               node.want-driver = "true"
+*               client.id = "82"
+*               object.id = "83"
+*               object.serial = "359"
+*       params: (5)
+*         1 (Spa:Enum:ParamId:PropInfo) --
+*         2 (Spa:Enum:ParamId:Props) -w
+*         16 (Spa:Enum:ParamId:ProcessLatency) --
+*         3 (Spa:Enum:ParamId:EnumFormat) --
+*         4 (Spa:Enum:ParamId:Format) -w
+
+
+
+
+Oui. **Le `pw-cli` confirme que le filtre est correct**, mais `state = suspended` est logique : aucun flux n'est connecté.
+
+Et j'ai trouvé le point important dans la doc PipeWire : pour un programme qui veut se comporter comme une **vraie sortie audio**, il faut le déclarer comme `Stream/Input/Audio` avec `media.category = Sink` et `node.autoconnect=true`. C'est exactement le modèle utilisé par l'exemple officiel `audio-dsp-sink`. ([PipeWire Documentation][1])
+
+### Étape 10 — test du « faux haut-parleur »
+
+On va d'abord vérifier **uniquement l'entrée Firefox → notre programme**.
+
+Dans `autogain.cpp`, dans `pw_filter_new_simple()`, remplace :
+
+```cpp
+PW_KEY_MEDIA_CATEGORY, "Filter",
+PW_KEY_MEDIA_ROLE, "DSP",
+PW_KEY_NODE_AUTOCONNECT, "true",
+```
+
+par :
+
+```cpp
+PW_KEY_MEDIA_CATEGORY, "Sink",
+PW_KEY_MEDIA_ROLE, "DSP",
+PW_KEY_MEDIA_CLASS, "Stream/Input/Audio",
+PW_KEY_NODE_AUTOCONNECT, "true",
+```
+
+Et pour ce test, **supprime les deux ports `output_FL` / `output_FR`**. On garde seulement :
+
+```text
+input_FL
+input_FR
+```
+
+Le callback fera simplement :
+
+```cpp
+float *in_l = static_cast<float *>(
+    pw_filter_get_dsp_buffer(d->in_l, n));
+
+float *in_r = static_cast<float *>(
+    pw_filter_get_dsp_buffer(d->in_r, n));
+
+if (!in_l || !in_r)
+    return;
+
+// test : rien à envoyer, on mesure seulement
+```
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Lance :
+
+```bash
+./autogain
+```
+
+Puis lance une vidéo Firefox et :
+
+```bash
+pw-link -l
+```
+
+### Résultat attendu
+
+```text
+Firefox:output_FL
+    → Mini Auto Gain:input_FL
+
+Firefox:output_FR
+    → Mini Auto Gain:input_FR
+```
+
+**Le son sera momentanément muet**, c'est normal : notre programme est maintenant le faux haut-parleur et ne renvoie encore rien.
+
+Si ça fonctionne, on aura validé la partie difficile :
+
+```text
+Firefox
+   ↓ automatique
+Mini Auto Gain
+```
+
+Ensuite on ajoute **une vraie sortie `pw_stream` vers ALSA** et on fera circuler les samples dans le programme. C'est cette architecture qui permettra ensuite le gain ×1→×40 sans dépendre de `pw-link` ou d'une règle WirePlumber. ([PipeWire Documentation][2])
+
+[1]: https://docs.pipewire.org/devel/audio-dsp-sink2_8c-example.html?utm_source=chatgpt.com "PipeWire: audio-dsp-sink2.c"
+[2]: https://docs.pipewire.org/page_streams.html?utm_source=chatgpt.com "PipeWire: Streams"
+
+
+
+
+
+resultat :
+Firefox:output_FL
+  |-> alsa_output.pci-0000_00_1f.3.analog-stereo:playback_FL
+
+
+
+
+Oui — ce résultat est très utile. **Le filtre n'est pas inséré.** Firefox continue directement vers ALSA.
+
+Et je corrige un point de mes étapes précédentes : **un filtre PipeWire classique ne s'auto-connecte volontairement pas**. WirePlumber le confirme ; pour l'insertion automatique, il faut construire un **smart filter**, donc une paire `Audio/Sink + Stream/Output/Audio` reliée en interne. ([PipeWire Documentation][1])
+
+### On change donc légèrement d'architecture
+
+```text
+Firefox
+   ↓
+[ Mini Auto Gain ]
+   ↓
+ALSA
+```
+
+Le mini-programme aura :
+
+```text
+nœud principal : Audio/Sink
+        ↕
+nœud interne : Stream/Output/Audio
+```
+
+avec :
+
+```text
+node.link-group = "mini-autogain"
+filter.smart = true
+```
+
+C'est précisément le mécanisme prévu par WirePlumber 0.5 pour insérer automatiquement un filtre dans la chaîne. ([PipeWire][2])
+
+**Bonne nouvelle : on n'a plus besoin de bricoler une règle WirePlumber pour Firefox.**
+
+### Avant de recoder
+
+Supprime notre ancien fichier vide/règle s'il existe :
+
+```bash
+rm -f ~/.config/wireplumber/wireplumber.conf.d/90-mini-autogain.conf
+```
+
+Puis :
+
+```bash
+systemctl --user restart wireplumber
+```
+
+**Étape suivante : je te donne le nouveau `autogain.cpp` complet**, avec cette architecture, mais encore avec **gain ×1**. On validera d'abord le routage automatique.
+
+[1]: https://docs.pipewire.org/page_tutorial7.html?utm_source=chatgpt.com "PipeWire: Tutorial - Part 7: Creating an Audio DSP Filter"
+[2]: https://pipewire.pages.freedesktop.org/wireplumber/policies/smart_filters.html?utm_source=chatgpt.com "Smart Filters — WirePlumber 0.5.17 documentation"
+
+
+
+
+
+d'accord
+
+
+
+
+Oui. On repart proprement avec le **smart filter**. Cette fois, le programme sera réellement conçu pour s'insérer entre Firefox et la sortie.
+
+### Étape 11 — nouveau `autogain.cpp`
+
+Remplace entièrement le fichier :
+
+```bash
+cd ~/mini-autogain
+nano autogain.cpp
+```
+
+Puis mets :
+
+```cpp
+#include <pipewire/pipewire.h>
+#include <pipewire/filter.h>
+
+#include <iostream>
+
+struct Data {
+    pw_main_loop *loop;
+    pw_filter *filter;
+
+    void *in_l;
+    void *in_r;
+    void *out_l;
+    void *out_r;
+};
+
+static void on_process(void *userdata, spa_io_position *position)
+{
+    Data *d = static_cast<Data *>(userdata);
+
+    uint32_t n = position->clock.duration;
+
+    float *in_l  = (float *)pw_filter_get_dsp_buffer(d->in_l, n);
+    float *in_r  = (float *)pw_filter_get_dsp_buffer(d->in_r, n);
+    float *out_l = (float *)pw_filter_get_dsp_buffer(d->out_l, n);
+    float *out_r = (float *)pw_filter_get_dsp_buffer(d->out_r, n);
+
+    if (!in_l || !in_r || !out_l || !out_r)
+        return;
+
+    // Test : gain ×1
+    for (uint32_t i = 0; i < n; ++i) {
+        out_l[i] = in_l[i];
+        out_r[i] = in_r[i];
+    }
+}
+
+static const pw_filter_events events = {
+    PW_VERSION_FILTER_EVENTS,
+    .process = on_process
+};
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    Data d{};
+
+    d.loop = pw_main_loop_new(nullptr);
+
+    auto props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Filter",
+        PW_KEY_MEDIA_ROLE, "DSP",
+        PW_KEY_NODE_NAME, "Mini Auto Gain",
+        PW_KEY_NODE_DESCRIPTION, "Mini Auto Gain",
+        PW_KEY_NODE_AUTOCONNECT, "true",
+        PW_KEY_NODE_LINK_GROUP, "mini-autogain",
+        PW_KEY_FILTER_SMART, "true",
+        nullptr
+    );
+
+    d.filter = pw_filter_new_simple(
+        pw_main_loop_get_loop(d.loop),
+        "Mini Auto Gain",
+        props,
+        &events,
+        &d
+    );
+
+    if (!d.filter) {
+        std::cerr << "Impossible de créer le filtre\n";
+        return 1;
+    }
+
+    d.in_l = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_INPUT,
+        0,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "input_FL",
+            nullptr),
+        nullptr, 0);
+
+    d.in_r = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_INPUT,
+        0,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "input_FR",
+            nullptr),
+        nullptr, 0);
+
+    d.out_l = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_OUTPUT,
+        0,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "output_FL",
+            nullptr),
+        nullptr, 0);
+
+    d.out_r = pw_filter_add_port(
+        d.filter,
+        PW_DIRECTION_OUTPUT,
+        0,
+        0,
+        pw_properties_new(
+            PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+            PW_KEY_PORT_NAME, "output_FR",
+            nullptr),
+        nullptr, 0);
+
+    int result = pw_filter_connect(
+        d.filter,
+        PW_FILTER_FLAG_RT_PROCESS,
+        nullptr,
+        0
+    );
+
+    if (result < 0) {
+        std::cerr << "Erreur connexion : " << result << "\n";
+        return 1;
+    }
+
+    std::cout << "Mini Auto Gain actif\n";
+
+    pw_main_loop_run(d.loop);
+
+    pw_filter_destroy(d.filter);
+    pw_main_loop_destroy(d.loop);
+    pw_deinit();
+
+    return 0;
+}
+```
+
+### Compiler
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Si ça compile, lance :
+
+```bash
+./autogain
+```
+
+Puis, **sans faire de `pw-link` manuellement**, lance une vidéo Firefox.
+
+Vérifie :
+
+```bash
+pw-link -l
+```
+
+### Objectif
+
+On veut voir quelque chose comme :
+
+```text
+Firefox
+  → Mini Auto Gain
+  → alsa_output...
+```
+
+Si ça fonctionne, **ne modifie plus rien** : on aura enfin le routage automatique et on pourra attaquer le vrai algorithme `gain`.
+
+
+
+
+
+build:
+**error:** ‘**PW\_KEY\_FILTER\_SMART**’ was not declared in this scope
+
+
+
+
+Oui. C'est simplement une constante absente de ta version des headers PipeWire. **Pas besoin de changer d'architecture.**
+
+Supprime cette ligne :
+
+```cpp
+PW_KEY_FILTER_SMART, "true",
+```
+
+Puis recompile :
+
+```bash id="7nqj4f"
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Si ça compile :
+
+```bash id="h8k2v1"
+./autogain
+```
+
+Puis :
+
+```bash id="e3x6m9"
+pw-cli info "Mini Auto Gain" | grep -E "node.name|node.link-group|filter.smart"
+```
+
+Et :
+
+```bash id="k4w1qp"
+pw-link -l
+```
+
+**Ne fais aucun `pw-link` manuel.**
+
+Envoie-moi les résultats. Ensuite on corrige éventuellement le mécanisme d'auto-insertion selon ce que ta version de PipeWire expose réellement.
+
+
+
+
+
+build:
+**error:** invalid conversion from ‘**int**’ to ‘**pw\_filter\_port\_flags**’ [**-fpermissive**]
+
+
+
+
+Oui, encore une différence d'API de ta version. `pw_filter_add_port()` attend un `pw_filter_port_flags`, alors que `0` est interprété comme `int`.
+
+Il suffit de caster les `0`.
+
+Pour les **4 appels** à `pw_filter_add_port()`, remplace :
+
+```cpp
+0,
+0,
+```
+
+par :
+
+```cpp
+static_cast<pw_filter_port_flags>(0),
+0,
+```
+
+Donc par exemple :
+
+```cpp
+d.in_l = pw_filter_add_port(
+    d.filter,
+    PW_DIRECTION_INPUT,
+    static_cast<pw_filter_port_flags>(0),
+    0,
+    pw_properties_new(
+        PW_KEY_FORMAT_DSP, "32 bit float mono audio",
+        PW_KEY_PORT_NAME, "input_FL",
+        nullptr),
+    nullptr, 0);
+```
+
+Fais exactement la même modification pour :
+
+```text
+in_r
+out_l
+out_r
+```
+
+Puis compile :
+
+```bash id="v6y4te"
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+👉 **Si ça compile cette fois, ne lance pas encore de `pw-link`.** Lance simplement :
+
+```bash id="m8f2qk"
+./autogain
+```
+
+et dis-moi uniquement si tu obtiens :
+
+```text
+Mini Auto Gain actif
+```
+
+sans erreur.
+
+
+
+
+
+d'accord, aucune erreur de build, mais la liste montre toujours firefox vers alsa.
+
+
+
+
+Oui, c'est normal avec **la version actuelle**. On doit arrêter de patcher ce code : il est configuré comme un `Filter` simple, et **un smart filter WirePlumber doit être une paire de nœuds**, pas un seul. ([PipeWire][1])
+
+### Ce que ça signifie
+
+Notre actuel :
+
+```text
+Mini Auto Gain
+    Filter
+```
+
+ne peut pas donner automatiquement :
+
+```text
+Firefox → Mini Auto Gain → ALSA
+```
+
+Le mécanisme smart filter attend plutôt :
+
+```text
+Firefox
+   ↓
+[ Main : Audio/Sink ]
+   ↓ interne
+[ Stream : Stream/Output/Audio ]
+   ↓
+ALSA
+```
+
+avec un même `node.link-group` et `filter.smart=true`. ([PipeWire][1])
+
+### Donc prochaine étape
+
+Je te propose de **repartir du modèle officiel `audio-dsp-sink`**, qui est justement un `Audio/Sink` PipeWire avec traitement DSP et autoconnection. ([PipeWire Documentation][2])
+
+On va faire :
+
+```text
+Firefox
+   ↓ automatique
+Mini Auto Gain
+   ↓
+ALSA
+```
+
+Puis seulement après :
+
+```text
+peak → gain = seuil / peak
+gain max = 40
+remontée = 5 s
+```
+
+**Ne change plus le code actuel pour l'instant.** Je vais te donner à l'étape suivante une version propre basée sur cette architecture, plutôt que continuer avec le mauvais modèle.
+
+[1]: https://pipewire.pages.freedesktop.org/wireplumber/policies/smart_filters.html?utm_source=chatgpt.com "Smart Filters — WirePlumber 0.5.17 documentation"
+[2]: https://docs.pipewire.org/1.6/audio-dsp-sink2_8c-example.html?utm_source=chatgpt.com "PipeWire: audio-dsp-sink2.c"
+
+
+
+
+
+ah d'accord. oui le résultat est :./autogain
+Mini Auto Gain actif
+
+d'accord
+
+
+
+
+Parfait. On a donc un programme **stable**, mais pas encore inséré dans le chemin audio.
+
+### Étape 12 — repartir sur un vrai `Audio/Sink`
+
+On va faire plus simple : **notre programme devient une sortie audio virtuelle**.
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓
+ALSA
+```
+
+Pour éviter une nouvelle série d'erreurs d'API, on va d'abord utiliser **l'exemple `audio-dsp-sink` de PipeWire comme base**, puis remplacer son DSP par notre gain.
+
+👉 **Ne modifie rien maintenant.**
+
+La prochaine étape sera de récupérer les exemples installés sur ton Kubuntu :
+
+```bash
+find /usr/share/doc -iname "*audio*dsp*" 2>/dev/null | head -20
+```
+
+et :
+
+```bash
+pkg-config --modversion libpipewire-0.3
+```
+
+Envoie-moi ces deux résultats. Ensuite je te donne **un seul fichier propre à compiler**, adapté à ta version exacte.
+
+
+
+
+
+resultats :
+$ find /usr/share/doc -iname "*audio*dsp*" 2>/dev/null | head -20
+$ pkg-config --modversion libpipewire-0.3
+1.6.2
+
+
+
+
+Parfait : **PipeWire 1.6.2**. On peut maintenant arrêter les essais précédents et suivre l'API correcte.
+
+Le point clé : pour créer un vrai **sink virtuel**, PipeWire indique qu'un `pw_stream` en `PW_DIRECTION_INPUT` doit avoir `media.class = "Audio/Sink"`. ([Fossies][1])
+
+### Étape 12 — créer uniquement le sink virtuel
+
+On ne traite pas encore le son. On vérifie juste :
+
+```text
+Firefox → Mini Auto Gain
+```
+
+Remplace le programme actuel par cette version minimale :
+
+```cpp
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+
+#include <iostream>
+#include <cmath>
+
+struct Data {
+    pw_main_loop *loop;
+    pw_stream *stream;
+};
+
+static void on_process(void *userdata)
+{
+    auto *d = static_cast<Data *>(userdata);
+
+    pw_buffer *b = pw_stream_dequeue_buffer(d->stream);
+    if (!b)
+        return;
+
+    spa_buffer *buf = b->buffer;
+    float *samples = static_cast<float *>(buf->datas[0].data);
+
+    if (samples && buf->datas[0].chunk) {
+        uint32_t n = buf->datas[0].chunk->size / sizeof(float);
+
+        float peak = 0.0f;
+        for (uint32_t i = 0; i < n; ++i)
+            peak = std::max(peak, std::fabs(samples[i]));
+
+        std::cout << "\rPeak: " << peak << std::flush;
+    }
+
+    pw_stream_queue_buffer(d->stream, b);
+}
+
+static const pw_stream_events events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_process
+};
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    Data d{};
+
+    d.loop = pw_main_loop_new(nullptr);
+
+    auto props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Playback",
+        PW_KEY_MEDIA_ROLE, "DSP",
+        PW_KEY_MEDIA_CLASS, "Audio/Sink",
+        PW_KEY_NODE_NAME, "Mini Auto Gain",
+        PW_KEY_NODE_DESCRIPTION, "Mini Auto Gain",
+        PW_KEY_NODE_AUTOCONNECT, "true",
+        nullptr
+    );
+
+    d.stream = pw_stream_new_simple(
+        pw_main_loop_get_loop(d.loop),
+        "Mini Auto Gain",
+        props,
+        &events,
+        &d
+    );
+
+    uint8_t buffer[1024];
+    spa_pod_builder builder =
+        SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+
+    const spa_pod *params =
+        spa_format_audio_raw_build(
+            &builder,
+            SPA_PARAM_EnumFormat,
+            &SPA_AUDIO_INFO_RAW_INIT(
+                .format = SPA_AUDIO_FORMAT_F32,
+                .channels = 2,
+                .rate = 48000
+            )
+        );
+
+    int r = pw_stream_connect(
+        d.stream,
+        PW_DIRECTION_INPUT,
+        PW_ID_ANY,
+        static_cast<pw_stream_flags>(
+            PW_STREAM_FLAG_AUTOCONNECT |
+            PW_STREAM_FLAG_MAP_BUFFERS |
+            PW_STREAM_FLAG_RT_PROCESS
+        ),
+        &params,
+        1
+    );
+
+    if (r < 0) {
+        std::cerr << "Erreur connexion: " << r << "\n";
+        return 1;
+    }
+
+    std::cout << "Mini Auto Gain - sink virtuel actif\n";
+
+    pw_main_loop_run(d.loop);
+
+    pw_stream_destroy(d.stream);
+    pw_main_loop_destroy(d.loop);
+    pw_deinit();
+}
+```
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Puis :
+
+```bash
+./autogain
+```
+
+### Test
+
+Dans un autre terminal :
+
+```bash
+wpctl status -n
+```
+
+**Cherche `Mini Auto Gain` dans les `Sinks`.**
+
+S'il apparaît, donne-moi simplement la ligne correspondante, par exemple :
+
+```text
+42. Mini Auto Gain
+```
+
+👉 **Ne fais pas encore `set-default`.**
+
+Après ça, on fera :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓
+sortie ALSA
+```
+
+avec un petit ring-buffer interne. C'est cette architecture qui permet de garder **tout le logiciel dans un seul exécutable**, sans fichier WirePlumber externe. ([pipewire.pages.freedesktop.org][2])
+
+[1]: https://fossies.org/linux/pipewire/src/pipewire/stream.h?utm_source=chatgpt.com "PipeWire: src/pipewire/stream.h | Fossies"
+[2]: https://pipewire.pages.freedesktop.org/pipewire/audio-src-ring2_8c-example.html?utm_source=chatgpt.com "PipeWire: audio-src-ring2.c"
+
+
+
+
+
+build:
+**error:** designator order for field ‘**spa\_audio\_info\_raw::rate**’ does not match declaration order in ‘**spa\_audio\_info\_raw**’
+
+
+
+
+Oui, simple : **l'ordre des champs de la macro ne correspond pas à l'ordre de la structure avec ton header PipeWire 1.6.2.**
+
+### Correction
+
+Remplace :
+
+```cpp
+const spa_pod *params =
+    spa_format_audio_raw_build(
+        &builder,
+        SPA_PARAM_EnumFormat,
+        &SPA_AUDIO_INFO_RAW_INIT(
+            .format = SPA_AUDIO_FORMAT_F32,
+            .channels = 2,
+            .rate = 48000
+        )
+    );
+```
+
+par :
+
+```cpp
+spa_audio_info_raw audio{};
+
+audio.format = SPA_AUDIO_FORMAT_F32;
+audio.channels = 2;
+audio.rate = 48000;
+
+const spa_pod *params =
+    spa_format_audio_raw_build(
+        &builder,
+        SPA_PARAM_EnumFormat,
+        &audio
+    );
+```
+
+Et ajoute aussi en haut :
+
+```cpp
+#include <algorithm>
+```
+
+Puis compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Si ça compile : `./autogain`.
+
+**On reste étape par étape : ne change rien d'autre pour l'instant.**
+
+
+
+
+
+resultat:
+Mini Auto Gain - sink virtuel actif
+
+
+
+
+Parfait. ✅ **Le sink virtuel fonctionne.**
+
+### Étape suivante — vérifier qu'il apparaît bien comme sortie
+
+Dans un autre terminal :
+
+```bash
+wpctl status -n
+```
+
+Cherche :
+
+```text
+Mini Auto Gain
+```
+
+dans **Sinks**.
+
+Puis :
+
+```bash
+pw-link -l
+```
+
+Pour l'instant, **ne fais aucun `pw-link` manuel** et ne change pas la sortie par défaut.
+
+Envoie-moi uniquement la partie `Sinks` de `wpctl status -n`.
+
+
+
+
+
+ │
+ ├─ Sinks:
+ │      42. Mini Auto Gain                      [vol: 1.00]
+ │  *   62. alsa_output.pci-0000_00_1f.3.analog-stereo [vol: 0.45]
+
+la liste montre firefox vers alsa.
+
+
+
+
+Parfait. **Le sink virtuel existe bien** (`42`). Le problème restant est uniquement le routage : Firefox choisit encore ALSA comme cible par défaut.
+
+### Étape suivante — test sans modifier le système
+
+On va déplacer **uniquement le flux Firefox actuel** vers le sink `42`.
+
+1. Fais :
+
+```bash
+wpctl status -n
+```
+
+2. Dans la section **Streams**, repère la ligne `Firefox` et son **ID numérique**.
+
+3. Envoie-moi par exemple :
+
+```text
+Firefox → ID 73
+```
+
+Je te donnerai ensuite **une seule commande** pour faire :
+
+```text
+Firefox → Mini Auto Gain
+```
+
+et vérifier que notre programme reçoit bien les samples (`Peak: ...`).
+
+`wpctl set-default 42` ne suffit pas pour le flux Firefox déjà existant : le changement de défaut concerne surtout les **nouveaux flux**. ([pipewire.pages.freedesktop.org][1])
+
+[1]: https://pipewire.pages.freedesktop.org/wireplumber/man/wpctl.html?utm_source=chatgpt.com "wpctl(1) — WirePlumber 0.5.17 documentation"
+
+
+
+
+
+ │
+ └─ Streams:
+        52. Firefox
+             93. output_FR       > ALC257 Analog:playback_FR    [active]
+             94. output_FL       > ALC257 Analog:playback_FL    [active]
+
+
+
+
+Parfait. **Firefox = flux 52**, et ses ports sont `93/94`.
+
+### Étape suivante — déplacer Firefox vers notre sink
+
+Essaie :
+
+```bash id="m3w8xk"
+wpctl move 52 42
+```
+
+Puis :
+
+```bash id="s4h7q2"
+wpctl status -n
+```
+
+On veut voir :
+
+```text
+52. Firefox
+     output_FR > Mini Auto Gain
+     output_FL > Mini Auto Gain
+```
+
+Et notre terminal `./autogain` devrait commencer à afficher :
+
+```text
+Peak: 0.123
+```
+
+ou une autre valeur.
+
+### ⚠️ Important
+
+Ne touche pas encore au volume et ne fais pas Play/Pause.
+
+**Envoie-moi le résultat de `wpctl status -n` après `wpctl move 52 42`.**
+
+
+
+
+
+commande invalide.
+Utilisation :
+  wpctl [OPTION…] COMMAND [COMMAND_OPTIONS] - WirePlumber Control CLI
+
+Commands:
+  status
+  get-volume ID
+  inspect ID
+  set-default ID
+  set-volume ID VOL[%][-/+]
+  set-mute ID 1|0|toggle
+  set-profile ID INDEX
+  set-route ID INDEX
+  clear-default [ID]
+  settings [KEY] [VAL]
+  set-log-level [ID] LEVEL
+
+
+
+
+Exact. 👍 Ton `wpctl` est une version où `move` n'existe pas. On va utiliser directement `pw-link`.
+
+### Étape suivante — test manuel du routage
+
+D'abord supprimer les 2 liens Firefox → ALSA :
+
+```bash id="q5r3ta"
+pw-link -d 52:93 62:playback_FL
+pw-link -d 52:94 62:playback_FR
+```
+
+Puis regarde les ports du sink :
+
+```bash id="v7x2kd"
+pw-link -i | grep "Mini Auto Gain"
+```
+
+On doit trouver quelque chose comme :
+
+```text
+Mini Auto Gain:input_FL
+Mini Auto Gain:input_FR
+```
+
+**Ne reconnecte rien encore.** Envoie-moi cette sortie : je te donnerai ensuite les **2 commandes exactes** pour :
+
+```text
+Firefox → Mini Auto Gain
+```
+
+Puis on vérifiera le `Peak`.
+
+
+
+
+(((
+((
+(
+
+ras lbol, ici j'ai foutu par default le cpp
+wpctl set-default 72
+(selon le nom du logiciel dans la liste des sink)
+
+)
+))
+)))
+
+oui !
+voici resultat pw-link
+**Mini Auto Gain**:playback\_1
+**Mini Auto Gain**:playback\_2
+
+
+
+
+Parfait. Ce sont bien les **2 entrées du sink**.
+
+### Étape suivante — Firefox → Mini Auto Gain
+
+```bash
+pw-link \
+"Firefox:output_FL" \
+"Mini Auto Gain:playback_1"
+
+pw-link \
+"Firefox:output_FR" \
+"Mini Auto Gain:playback_2"
+```
+
+Puis :
+
+```bash
+pw-link -l
+```
+
+Et regarde le terminal où `./autogain` tourne : il devrait maintenant afficher des `Peak: ...`.
+
+⚠️ Le son sera probablement **muet pour l'instant** : notre sink reçoit les données mais ne les renvoie pas encore vers ALSA. **C'est volontaire.**
+
+Envoie-moi simplement :
+
+* la sortie `pw-link -l`
+* et si `Peak:` apparaît.
+
+
+
+
+
+exact ! ça fonctionne
+Peak: 0.00723344
+
+
+
+
+Parfait ! 🎯 **Étape validée.**
+
+On a maintenant :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓
+Peak détecté : 0.00723
+```
+
+Donc **le programme reçoit réellement l'audio stéréo**.
+
+### Étape suivante
+
+Ajouter dans le même programme une **sortie PipeWire vers ALSA** :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓
+copie ×1
+   ↓
+ALSA
+```
+
+Objectif immédiat : **retrouver le son exactement comme avant**, sans encore appliquer d'Auto Gain.
+
+Ensuite seulement :
+
+```text
+peak
+ ↓
+si peak > seuil
+gain = seuil / peak
+ ↓
+sinon gain remonte doucement pendant 5 s
+```
+
+👉 **Ne change rien pour l'instant.** Le prochain code ajoutera uniquement la sortie audio.
+
+
+
+
+
+il manque surement mini auto gain:output vers alsa
+
+
+
+
+Oui, **exactement**. 👍
+
+Actuellement :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain : playback_1/2
+   ↓
+❌ rien
+```
+
+`playback_1/2` sont les **entrées du sink**, pas une sortie vers ALSA.
+
+### Prochaine étape
+
+On ajoute un **second nœud PipeWire** :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain IN
+   ↓
+traitement ×1
+   ↓
+Mini Auto Gain OUT
+   ↓
+ALSA
+```
+
+C'est justement l'architecture « smart filter » prévue par WirePlumber : un nœud `Audio/Sink` reçoit l'application, puis un nœud `Stream/Output/Audio` renvoie le résultat vers le périphérique. ([PipeWire][1])
+
+Et tout restera **dans `autogain.cpp`**, sans configuration externe.
+
+**Étape suivante : on ajoute cette sortie, toujours en ×1, pour simplement retrouver le son.**
+
+[1]: https://pipewire.pages.freedesktop.org/wireplumber/policies/smart_filters.html?utm_source=chatgpt.com "Smart Filters — WirePlumber 0.5.17 documentation"
+
+
+
+
+
+super
+
+
+
+
+Oui 👍
+
+On a enfin validé la partie la plus importante :
+
+```text
+Firefox → Mini Auto Gain
+```
+
+avec **vrai audio reçu** et `Peak` mesurable.
+
+La prochaine modification sera uniquement :
+
+```text
+Mini Auto Gain
+      ↓ ×1
+     ALSA
+```
+
+Puis on testera le son. **Pas encore d'Auto Gain**, pas de 5 s, pas de ×40 : une seule étape à la fois.
+
+
+
+
+
+d'accord, je n'ai toujours pas de son ni de auto gain
+
+
+
+
+Oui, normal : **notre version actuelle reçoit le son, mais ne possède aucune sortie audio**. Donc rien ne peut revenir vers ALSA.
+
+### Étape suivante — sortie ×1
+
+On ajoute :
+
+* `Mini Auto Gain` = entrée virtuelle
+* `Mini Auto Gain Output` = sortie vers ALSA
+* un petit buffer entre les deux
+* **gain fixe ×1 pour le test**
+
+C'est bien le modèle `Audio/Sink` + `Stream/Output/Audio` attendu par le smart-filter WirePlumber. ([PipeWire][1])
+
+Remplace `autogain.cpp` entièrement par ceci :
+
+```cpp
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/utils/ringbuffer.h>
+
+#include <algorithm>
+#include <cstring>
+#include <iostream>
+
+static constexpr uint32_t RATE = 48000;
+static constexpr uint32_t CHANNELS = 2;
+static constexpr uint32_t RING_FRAMES = 32768;
+static constexpr uint32_t STRIDE = sizeof(float) * CHANNELS;
+
+struct Data {
+    pw_main_loop *loop;
+    pw_stream *input;
+    pw_stream *output;
+
+    spa_ringbuffer ring;
+    float ring_data[RING_FRAMES * CHANNELS];
+};
+
+static void on_input(void *userdata)
+{
+    auto *d = static_cast<Data *>(userdata);
+
+    pw_buffer *b = pw_stream_dequeue_buffer(d->input);
+    if (!b)
+        return;
+
+    spa_buffer *buf = b->buffer;
+    auto *chunk = buf->datas[0].chunk;
+    auto *src = static_cast<uint8_t *>(buf->datas[0].data);
+
+    if (!src || !chunk) {
+        pw_stream_queue_buffer(d->input, b);
+        return;
+    }
+
+    uint32_t frames = chunk->size / STRIDE;
+    uint32_t index = 0;
+
+    int32_t filled = spa_ringbuffer_get_write_index(
+        &d->ring, &index);
+
+    if (filled >= 0) {
+        uint32_t space = RING_FRAMES - filled;
+        uint32_t count = std::min(frames, space);
+
+        if (count > 0) {
+            spa_ringbuffer_write_data(
+                &d->ring,
+                d->ring_data,
+                sizeof(d->ring_data),
+                (index % RING_FRAMES) * STRIDE,
+                src + chunk->offset,
+                count * STRIDE);
+
+            spa_ringbuffer_write_update(
+                &d->ring, index + count);
+        }
+    }
+
+    pw_stream_queue_buffer(d->input, b);
+}
+
+static void on_output(void *userdata)
+{
+    auto *d = static_cast<Data *>(userdata);
+
+    pw_buffer *b = pw_stream_dequeue_buffer(d->output);
+    if (!b)
+        return;
+
+    spa_buffer *buf = b->buffer;
+    auto *dst = static_cast<uint8_t *>(buf->datas[0].data);
+
+    if (!dst) {
+        pw_stream_queue_buffer(d->output, b);
+        return;
+    }
+
+    uint32_t frames =
+        buf->datas[0].maxsize / STRIDE;
+
+    if (b->requested)
+        frames = std::min(
+            frames,
+            static_cast<uint32_t>(b->requested));
+
+    uint32_t index = 0;
+
+    int32_t available =
+        spa_ringbuffer_get_read_index(
+            &d->ring, &index);
+
+    uint32_t count = 0;
+
+    if (available > 0)
+        count = std::min(
+            static_cast<uint32_t>(available),
+            frames);
+
+    if (count > 0) {
+        spa_ringbuffer_read_data(
+            &d->ring,
+            d->ring_data,
+            sizeof(d->ring_data),
+            (index % RING_FRAMES) * STRIDE,
+            dst,
+            count * STRIDE);
+
+        spa_ringbuffer_read_update(
+            &d->ring, index + count);
+    }
+
+    // Silence si le buffer manque de données
+    if (count < frames) {
+        std::memset(
+            dst + count * STRIDE,
+            0,
+            (frames - count) * STRIDE);
+    }
+
+    // Pour l'instant : gain ×1
+
+    buf->datas[0].chunk->offset = 0;
+    buf->datas[0].chunk->stride = STRIDE;
+    buf->datas[0].chunk->size = frames * STRIDE;
+
+    pw_stream_queue_buffer(d->output, b);
+}
+
+static const pw_stream_events input_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_input
+};
+
+static const pw_stream_events output_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_output
+};
+
+int main()
+{
+    pw_init(nullptr, nullptr);
+
+    Data d{};
+    spa_ringbuffer_init(&d.ring);
+
+    d.loop = pw_main_loop_new(nullptr);
+
+    // ----- Entrée : Audio/Sink -----
+
+    d.input = pw_stream_new_simple(
+        pw_main_loop_get_loop(d.loop),
+        "Mini Auto Gain",
+        pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Playback",
+            PW_KEY_MEDIA_ROLE, "DSP",
+            PW_KEY_MEDIA_CLASS, "Audio/Sink",
+            PW_KEY_NODE_NAME, "Mini Auto Gain",
+            PW_KEY_NODE_DESCRIPTION, "Mini Auto Gain",
+            PW_KEY_NODE_LINK_GROUP, "mini-autogain",
+            "filter.smart", "true",
+            "filter.smart.name", "Mini Auto Gain",
+            nullptr),
+        &input_events,
+        &d);
+
+    // ----- Sortie : Stream/Output/Audio -----
+
+    d.output = pw_stream_new_simple(
+        pw_main_loop_get_loop(d.loop),
+        "Mini Auto Gain Output",
+        pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Playback",
+            PW_KEY_MEDIA_ROLE, "DSP",
+            PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
+            PW_KEY_NODE_NAME, "Mini Auto Gain Output",
+            PW_KEY_NODE_LINK_GROUP, "mini-autogain",
+            PW_KEY_NODE_PASSIVE, "true",
+            "stream.dont-remix", "true",
+            nullptr),
+        &output_events,
+        &d);
+
+    // ----- Format -----
+
+    spa_audio_info_raw audio{};
+    audio.format = SPA_AUDIO_FORMAT_F32;
+    audio.channels = CHANNELS;
+    audio.rate = RATE;
+
+    uint8_t in_buffer[1024];
+    uint8_t out_buffer[1024];
+
+    spa_pod_builder in_builder =
+        SPA_POD_BUILDER_INIT(in_buffer, sizeof(in_buffer));
+
+    spa_pod_builder out_builder =
+        SPA_POD_BUILDER_INIT(out_buffer, sizeof(out_buffer));
+
+    const spa_pod *in_params =
+        spa_format_audio_raw_build(
+            &in_builder,
+            SPA_PARAM_EnumFormat,
+            &audio);
+
+    const spa_pod *out_params =
+        spa_format_audio_raw_build(
+            &out_builder,
+            SPA_PARAM_EnumFormat,
+            &audio);
+
+    int r1 = pw_stream_connect(
+        d.input,
+        PW_DIRECTION_INPUT,
+        PW_ID_ANY,
+        static_cast<pw_stream_flags>(
+            PW_STREAM_FLAG_AUTOCONNECT |
+            PW_STREAM_FLAG_MAP_BUFFERS |
+            PW_STREAM_FLAG_RT_PROCESS),
+        &in_params,
+        1);
+
+    int r2 = pw_stream_connect(
+        d.output,
+        PW_DIRECTION_OUTPUT,
+        PW_ID_ANY,
+        static_cast<pw_stream_flags>(
+            PW_STREAM_FLAG_AUTOCONNECT |
+            PW_STREAM_FLAG_MAP_BUFFERS |
+            PW_STREAM_FLAG_RT_PROCESS),
+        &out_params,
+        1);
+
+    if (r1 < 0 || r2 < 0) {
+        std::cerr << "Erreur PipeWire : "
+                  << r1 << " / " << r2 << "\n";
+        return 1;
+    }
+
+    std::cout << "Mini Auto Gain actif - gain x1\n";
+
+    pw_main_loop_run(d.loop);
+
+    pw_stream_destroy(d.output);
+    pw_stream_destroy(d.input);
+    pw_main_loop_destroy(d.loop);
+
+    pw_deinit();
+    return 0;
+}
+```
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Puis :
+
+```bash
+./autogain
+```
+
+**Important : ne fais plus de `pw-link` manuel.**
+
+Lance/re-lance une vidéo Firefox puis :
+
+```bash
+pw-link -l
+```
+
+On cherche :
+
+```text
+Firefox
+  → Mini Auto Gain
+
+Mini Auto Gain Output
+  → alsa_output...
+```
+
+Et surtout : **le son doit revenir, toujours en ×1**.
+
+Les deux flux utilisent ici le mécanisme `pw_stream` + buffer, conforme au fonctionnement PipeWire documenté. ([PipeWire][2])
+
+Si le build passe mais que le routage ne se fait pas automatiquement, on corrigera **uniquement le smart-filter**, sans toucher au traitement audio.
+
+[1]: https://pipewire.pages.freedesktop.org/wireplumber/policies/smart_filters.html?utm_source=chatgpt.com "Smart Filters — WirePlumber 0.5.17 documentation"
+[2]: https://pipewire.pages.freedesktop.org/pipewire/group__pw__stream.html?utm_source=chatgpt.com "PipeWire: Stream"
+
+
+
+
+
+génial oui
+
+
+
+
+Parfait. 🎯
+
+On a maintenant la chaîne complète :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓ ×1
+ALSA
+```
+
+### Étape suivante : le vrai Auto Gain
+
+On ajoute seulement :
+
+```text
+peak = max(|L|, |R|)
+```
+
+Puis :
+
+```text
+si peak > seuil :
+    gain = seuil / peak
+```
+
+avec :
+
+```text
+gain max = 40
+```
+
+Et quand le son baisse :
+
+```text
+gain → 1
+```
+
+**progressivement sur 5 secondes**, pour éviter les remontées brutales.
+
+On garde la stéréo liée par **un seul gain commun L/R**, comme prévu.
+
+👉 Prochaine étape : ajouter cet algorithme au code actuel, sans toucher au routage.
+
+
+
+
+
+d'accord
+
+
+
+
+Parfait. Étape suivante : **uniquement l'algorithme Auto Gain**, sans toucher au routage.
+
+### 1. Ajoute dans `Data`
+
+```cpp
+float gain = 1.0f;
+```
+
+### 2. Ajoute ces constantes
+
+Près de `RATE` :
+
+```cpp
+static constexpr float TARGET = 0.80f;   // niveau cible
+static constexpr float MAX_GAIN = 40.0f;
+static constexpr float RELEASE = 5.0f;   // remontée en secondes
+```
+
+### 3. Dans `on_output()`
+
+Remplace :
+
+```cpp
+// Pour l'instant : gain ×1
+```
+
+par :
+
+```cpp
+// Cherche le peak du buffer
+float peak = 0.0f;
+
+float *samples = reinterpret_cast<float *>(dst);
+
+for (uint32_t i = 0; i < frames * CHANNELS; ++i)
+    peak = std::max(peak, std::fabs(samples[i]));
+
+// Gain souhaité
+float target_gain = MAX_GAIN;
+
+if (peak > 0.000001f)
+    target_gain = std::min(MAX_GAIN, TARGET / peak);
+
+// Peak trop fort : baisse immédiate
+if (target_gain < d->gain) {
+    d->gain = target_gain;
+}
+// Signal plus faible : remontée linéaire sur 5 s
+else {
+    float step = (target_gain - d->gain)
+               * frames / (RELEASE * RATE);
+
+    d->gain += step;
+
+    if (d->gain > target_gain)
+        d->gain = target_gain;
+}
+
+// Applique UN seul gain aux deux canaux
+for (uint32_t i = 0; i < frames * CHANNELS; ++i)
+    samples[i] *= d->gain;
+```
+
+Ajoute aussi en haut :
+
+```cpp
+#include <cmath>
+```
+
+### Résultat
+
+```text
+peak > 0.80
+    ↓
+gain = 0.80 / peak       ← immédiat
+
+peak faible
+    ↓
+gain remonte doucement
+    ↓
+maximum ×40
+```
+
+**Même gain pour L et R**, donc la stéréo reste intacte.
+
+Compile :
+
+```bash
+g++ -O2 -std=c++17 autogain.cpp -o autogain \
+    $(pkg-config --cflags --libs libpipewire-0.3)
+```
+
+Puis teste avec une vidéo à faible volume. **On valide d'abord ce comportement avant d'affiner `TARGET` et les 5 secondes.**
+
+
+
+
+
+super ! on a pratiquement terminé je pense, tout fonctionne, il faut juste basculer vers deamon je pense
+
+
+
+
+Oui. **Ne pas transformer le programme en daemon lui-même** : le plus propre sous Kubuntu est un **service systemd utilisateur** qui lance `./autogain` au démarrage de session.
+
+### Étape finale — service
+
+```bash
+mkdir -p ~/.config/systemd/user
+nano ~/.config/systemd/user/mini-autogain.service
+```
+
+Colle :
+
+```ini
+[Unit]
+Description=Mini Auto Gain
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/mini-autogain/autogain
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+Puis :
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now mini-autogain.service
+```
+
+### Vérification
+
+```bash
+systemctl --user status mini-autogain
+```
+
+Tu dois avoir :
+
+```text
+Active: active (running)
+```
+
+Puis vérifie :
+
+```bash
+journalctl --user -u mini-autogain -n 20
+```
+
+### Test important
+
+Ferme `./autogain` lancé manuellement, puis :
+
+```bash
+systemctl --user restart mini-autogain
+```
+
+Lance Firefox → son → vérifie que **Mini Auto Gain fonctionne sans terminal ouvert**.
+
+Si tout est OK, **le projet est pratiquement terminé** : démarrage automatique, routage PipeWire, ×1→×40, peak immédiat, remontée 5 s.
+
+
+
+
+tout est ok !
+
+
+
+
+🎉 Parfait ! **Mini Auto Gain est terminé et fonctionnel.**
+
+Tu as maintenant :
+
+```text
+Firefox
+   ↓
+Mini Auto Gain
+   ↓
+ALSA
+```
+
+* 🎚️ gain automatique **×1 → ×40**
+* 🔊 baisse immédiate sur les peaks
+* 📈 remontée progressive sur **5 s**
+* 🎧 gain commun L/R → stéréo préservée
+* 🔄 fonctionne avec Play/Pause
+* 🚀 démarrage automatique via systemd
+* ⚙️ aucune configuration externe
+* 🖥️ tourne en arrière-plan
+
+**Bravo, on a construit le petit DSP exactement dans l'esprit prévu.**
